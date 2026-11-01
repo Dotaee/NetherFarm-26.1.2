@@ -120,11 +120,22 @@ public final class NetherFarmClient implements ClientModInitializer {
     private static final double ENTITY_DETECT_BEHIND = 6.0;
     /** Largeur de détection de chaque côté de ta ligne (couvre un 3x3 devant toi). */
     private static final double ENTITY_DETECT_SIDE = 2.5;
+    /** Zone verticale de détection par rapport à toi (évite les cibles d'un autre étage). */
+    private static final double ENTITY_DETECT_DOWN = 4.5;
+    private static final double ENTITY_DETECT_UP = 2.0;
+    /** Ignore les cibles cachées derrière des blocs (autre étage, murs). */
+    private static final boolean REQUIRE_LINE_OF_SIGHT = true;
+    /** Ignore les `interaction` sans visuel à côté (entité invisible qui ne correspond à aucune citrouille). */
+    private static final boolean REQUIRE_VISUAL_NEARBY = true;
+    /** Affiche dans le chat chaque cible choisie (type, taille, distance) pour comprendre ce qu'il vise. */
+    private static final boolean DEBUG_TARGETS = true;
+    /** Temps max (ticks) passé sur une même cible, approche comprise, avant de l'abandonner. */
+    private static final int BREAK_MAX_TOTAL_TICKS = 300;
     /** Le mod s'approche jusqu'à cette distance (yeux -> centre) avant de frapper (portée vanilla : 3). */
     private static final double ENTITY_APPROACH_DIST = 2.6;
     private static final int BREAK_CLICKS = 6;                 // nombre de coups
     private static final int BREAK_CLICK_INTERVAL_TICKS = 4;   // délai entre deux coups
-    private static final int BREAK_MAX_ROUNDS = 3;             // séries de 6 coups max avant d'abandonner
+    private static final int BREAK_MAX_ROUNDS = 2;             // séries de 6 coups max avant d'abandonner
     private static final double BREAK_REACH = 4.5;             // portée max (yeux -> centre du bloc)
     private static final int SPECIAL_SCAN_AHEAD = 5;           // blocs scannés devant toi
     private static final int SPECIAL_SCAN_DOWN = 6;            // blocs scannés sous toi
@@ -192,6 +203,9 @@ public final class NetherFarmClient implements ClientModInitializer {
     private static int breakRounds = 0;
     private static int breakAimTicks = 0;
     private static int breakApproachTicks = 0;
+    private static int breakTotalTicks = 0;
+    private static int specialPauseTicks = 0;
+    private static final Set<Long> ignoredEntityPositions = new HashSet<>();
     private static boolean chainActive = false;
     private static int chainCount = 0;
     private static final Set<BlockPos> ignoredBreak = new HashSet<>();
@@ -403,6 +417,8 @@ public final class NetherFarmClient implements ClientModInitializer {
         chainActive = false;
         ignoredBreak.clear();
         ignoredEntities.clear();
+        ignoredEntityPositions.clear();
+        specialPauseTicks = 0;
         stuckTicks = 0;
         stuckAnchor = startAlong;
         message(mc, "Parcours lancé : " + LANE_COUNT + " bandes x " + FLOORS
@@ -458,8 +474,14 @@ public final class NetherFarmClient implements ClientModInitializer {
                 handleBreak(mc, player);
                 return;
             }
-            BlockPos found = findSpecialBlock(mc, player, pos, dirSign);
-            Entity foundEntity = (found == null) ? findSpecialEntity(mc, player, pos, dirSign) : null;
+            BlockPos found = null;
+            Entity foundEntity = null;
+            if (specialPauseTicks > 0) {
+                specialPauseTicks--;
+            } else {
+                found = findSpecialBlock(mc, player, pos, dirSign);
+                if (found == null) foundEntity = findSpecialEntity(mc, player, pos, dirSign);
+            }
             // Automatique : toute entité qui se trouve sous le viseur (hors joueurs et objets au sol).
             if (AUTO_CROSSHAIR_ENTITY && found == null && foundEntity == null
                     && mc.hitResult instanceof EntityHitResult eh) {
@@ -476,6 +498,13 @@ public final class NetherFarmClient implements ClientModInitializer {
                     message(mc, "Cible(s) repérée(s) : j'y vais (" + BREAK_CLICKS + " coups chacune).");
                 }
                 chainCount++;
+                if (DEBUG_TARGETS) {
+                    message(mc, "Cible : " + (foundEntity != null
+                            ? describeEntity(foundEntity) + " à "
+                                    + String.format(Locale.ROOT, "%.1f", foundEntity.distanceTo(player)) + " blocs"
+                            : "bloc " + BuiltInRegistries.BLOCK
+                                    .getKey(mc.level.getBlockState(found).getBlock())));
+                }
                 breaking = true;
                 breakTarget = found;
                 breakEntity = foundEntity;
@@ -485,6 +514,7 @@ public final class NetherFarmClient implements ClientModInitializer {
                 breakRounds = 0;
                 breakAimTicks = 0;
                 breakApproachTicks = 0;
+                breakTotalTicks = 0;
                 handleBreak(mc, player);
                 return;
             } else if (chainActive) {
@@ -621,7 +651,8 @@ public final class NetherFarmClient implements ClientModInitializer {
 
     private static boolean isSpecialEntity(Entity e) {
         if (e instanceof Player || e instanceof ItemEntity || e.isRemoved()
-                || ignoredEntities.contains(e.getId())) return false;
+                || ignoredEntities.contains(e.getId())
+                || ignoredEntityPositions.contains(e.blockPosition().asLong())) return false;
         // Sans hitbox (affichage visuel seulement, ex. verrue brillante) : on ignore.
         if (!e.isPickable()) return false;
         String id = BuiltInRegistries.ENTITY_TYPE.getKey(e.getType()).getPath();
@@ -648,7 +679,9 @@ public final class NetherFarmClient implements ClientModInitializer {
             double vertical = c.y - pos.y;
             if (forward < -ENTITY_DETECT_BEHIND || forward > ENTITY_DETECT_AHEAD) continue;
             if (Math.abs(lateral) > ENTITY_DETECT_SIDE) continue;
-            if (vertical < -10 || vertical > 3) continue;
+            if (vertical < -ENTITY_DETECT_DOWN || vertical > ENTITY_DETECT_UP) continue;
+            if (REQUIRE_LINE_OF_SIGHT && !player.hasLineOfSight(e)) continue;
+            if (REQUIRE_VISUAL_NEARBY && !hasVisualNearby(mc, e)) continue;
             double dx = c.x - eye.x;
             double dy = c.y - eye.y;
             double dz = c.z - eye.z;
@@ -661,6 +694,19 @@ public final class NetherFarmClient implements ClientModInitializer {
         return best;
     }
 
+    /** Une autre entité (affichage, support d'armure...) à moins de ~1 bloc : le visuel de la citrouille. */
+    private static boolean hasVisualNearby(Minecraft mc, Entity e) {
+        Vec3 p = e.position();
+        for (Entity other : mc.level.entitiesForRendering()) {
+            if (other == e || other instanceof Player || other.getType() == e.getType()) continue;
+            Vec3 q = other.position();
+            double dx = q.x - p.x;
+            double dz = q.z - p.z;
+            if (dx * dx + dz * dz <= 1.44 && Math.abs(q.y - p.y) <= 2.0) return true;
+        }
+        return false;
+    }
+
     /** Signature d'une entité : type|largeur|hauteur (une décimale). */
     private static String entitySignature(Entity e) {
         return BuiltInRegistries.ENTITY_TYPE.getKey(e.getType()).getPath()
@@ -671,6 +717,9 @@ public final class NetherFarmClient implements ClientModInitializer {
     private static String describeEntity(Entity e) {
         StringBuilder sb = new StringBuilder(entitySignature(e));
         sb.append(e.isPickable() ? " cliquable" : " non-cliquable");
+        if (BuiltInRegistries.ENTITY_TYPE.getKey(e.getType()).getPath().equals("interaction")) {
+            sb.append(hasVisualNearby(Minecraft.getInstance(), e) ? " visuel=oui" : " visuel=non");
+        }
         if (e.isCurrentlyGlowing()) sb.append(" brille");
         if (e.getCustomName() != null) sb.append(" nom=").append(e.getCustomName().getString());
         return sb.toString();
@@ -699,6 +748,13 @@ public final class NetherFarmClient implements ClientModInitializer {
     /** Un tick de la séquence : viser le bloc, taper BREAK_CLICKS fois, vérifier, recommencer si besoin. */
     private static void handleBreak(Minecraft mc, LocalPlayer player) {
         releaseKeys(mc);
+
+        breakTotalTicks++;
+        if (breakTotalTicks > BREAK_MAX_TOTAL_TICKS) {
+            finishBreak(mc, false);
+            specialPauseTicks = 100;   // 5 s sans rechercher de cible, pour ne pas rester bloqué
+            return;
+        }
 
         Vec3 center;
         if (breakEntity != null) {
@@ -733,7 +789,7 @@ public final class NetherFarmClient implements ClientModInitializer {
             double dist3 = Math.sqrt(hd * hd + dy * dy);
             if (dist3 > ENTITY_APPROACH_DIST) {
                 breakApproachTicks++;
-                if (breakApproachTicks > 120) {
+                if (breakApproachTicks > 60) {
                     finishBreak(mc, false);
                     return;
                 }
@@ -788,7 +844,10 @@ public final class NetherFarmClient implements ClientModInitializer {
 
     private static void finishBreak(Minecraft mc, boolean success) {
         if (!success) {
-            if (breakEntity != null) ignoredEntities.add(breakEntity.getId());
+            if (breakEntity != null) {
+                ignoredEntities.add(breakEntity.getId());
+                ignoredEntityPositions.add(breakEntity.blockPosition().asLong());
+            }
             else if (breakTarget != null) ignoredBreak.add(breakTarget);
         }
         if (!success) message(mc, "Cible non cassée, je l'ignore.");
