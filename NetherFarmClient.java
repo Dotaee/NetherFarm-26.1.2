@@ -7,6 +7,7 @@ import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
 import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.screens.PauseScreen;
 import net.minecraft.client.multiplayer.ClientPacketListener;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
@@ -16,10 +17,15 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
 import net.minecraft.util.Mth;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 import org.lwjgl.glfw.GLFW;
 
+import java.util.HashSet;
 import java.util.Locale;
+import java.util.Set;
 
 /**
  * NetherFarm v0.3 : parcourt un champ de nether wart en bandes de 3 blocs (houe 3x3).
@@ -84,6 +90,23 @@ public final class NetherFarmClient implements ClientModInitializer {
     /** true = le joueur sprinte pendant les bandes (vole plus vite). */
     private static final boolean SPRINT_ENABLED = true;
 
+    // ---- Blocs spéciaux à casser (citrouille dorée) ----
+    private static final boolean SPECIAL_BREAK_ENABLED = true;
+    /** Identifiants de blocs (sans "minecraft:") à casser. Touche B = affiche l'identifiant du bloc visé. */
+    private static final Set<String> SPECIAL_BLOCK_IDS = Set.of(
+            "pumpkin", "carved_pumpkin", "jack_o_lantern", "hay_block", "gold_block");
+    private static final int BREAK_CLICKS = 6;                 // nombre de coups
+    private static final int BREAK_CLICK_INTERVAL_TICKS = 4;   // délai entre deux coups
+    private static final int BREAK_MAX_ROUNDS = 3;             // séries de 6 coups max avant d'abandonner
+    private static final double BREAK_REACH = 4.5;             // portée max (yeux -> centre du bloc)
+    private static final int SPECIAL_SCAN_AHEAD = 5;           // blocs scannés devant toi
+    private static final int SPECIAL_SCAN_DOWN = 6;            // blocs scannés sous toi
+    private static final float MAX_PITCH_STEP = 8.0f;          // degrés par tick pour viser / reprendre l'inclinaison
+
+    // ---- Fenêtre en arrière-plan ----
+    /** true = le menu du jeu ne s'ouvre plus quand tu quittes la fenêtre, et le mod continue de tourner. */
+    private static final boolean KEEP_RUNNING_IN_BACKGROUND = true;
+
     // ---- Commandes périodiques (en alternance) ----
     private static final boolean PERIODIC_COMMANDS_ENABLED = true;
     /** Une commande toutes les N bandes terminées. */
@@ -112,6 +135,19 @@ public final class NetherFarmClient implements ClientModInitializer {
     private static int laneTicks = 0;
     private static int lanesCompletedThisRun = 0;
     private static int pauseTicks = 0;
+    private static boolean pauseOptionChanged = false;
+    private static boolean previousPauseOnLostFocus = true;
+    private static boolean breaking = false;
+    private static BlockPos breakTarget = null;
+    private static int breakClicksDone = 0;
+    private static int breakCooldown = 0;
+    private static int breakSettle = 0;
+    private static int breakRounds = 0;
+    private static int breakAimTicks = 0;
+    private static final Set<BlockPos> ignoredBreak = new HashSet<>();
+    private static final InputConstants.Key LEFT_MOUSE =
+            InputConstants.Type.MOUSE.getOrCreate(GLFW.GLFW_MOUSE_BUTTON_LEFT);
+    private static KeyMapping inspectKey;
     private static boolean nextCommandIsA = true;
     private static int badRestarts = 0;
     private static int stuckTicks = 0;
@@ -132,6 +168,9 @@ public final class NetherFarmClient implements ClientModInitializer {
         toggleKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(
                 "key.netherfarm.toggle", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_N, category));
 
+        inspectKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(
+                "key.netherfarm.inspect", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_B, category));
+
         ClientTickEvents.END_CLIENT_TICK.register(NetherFarmClient::tick);
         ClientReceiveMessageEvents.GAME.register((message, overlay) -> onChatMessage(message));
         ClientReceiveMessageEvents.CHAT.register(
@@ -144,6 +183,7 @@ public final class NetherFarmClient implements ClientModInitializer {
         LocalPlayer player = mc.player;
         if (player == null || mc.level == null) {
             running = false;
+            restorePauseOption(mc);
             return;
         }
 
@@ -156,7 +196,20 @@ public final class NetherFarmClient implements ClientModInitializer {
                 chatMention = false;
                 laneCounter = 0;
                 badRestarts = 0;
+                if (KEEP_RUNNING_IN_BACKGROUND && !pauseOptionChanged) {
+                    previousPauseOnLostFocus = mc.options.pauseOnLostFocus;
+                    mc.options.pauseOnLostFocus = false;
+                    pauseOptionChanged = true;
+                }
                 sendHome(mc);
+            }
+        }
+        while (inspectKey.consumeClick()) {
+            if (mc.hitResult instanceof BlockHitResult hit && hit.getType() == HitResult.Type.BLOCK) {
+                Block b = mc.level.getBlockState(hit.getBlockPos()).getBlock();
+                message(mc, "Bloc visé : " + BuiltInRegistries.BLOCK.getKey(b));
+            } else {
+                message(mc, "Aucun bloc visé.");
             }
         }
         if (!running) return;
@@ -175,6 +228,10 @@ public final class NetherFarmClient implements ClientModInitializer {
             stop(mc);
             message(mc, "Arrêt : un message du chat contient ton pseudo. Réponds, puis relance avec N.");
             return;
+        }
+        // Menu du jeu ouvert parce que la fenêtre a perdu le focus : on le ferme et on continue.
+        if (KEEP_RUNNING_IN_BACKGROUND && mc.screen instanceof PauseScreen && !mc.isWindowActive()) {
+            mc.setScreen(null);
         }
         if (mc.screen != null) {
             releaseKeys(mc);
@@ -219,6 +276,8 @@ public final class NetherFarmClient implements ClientModInitializer {
             badRestarts = 0;
         }
         message(mc, reason + " : retour au /" + HOME_COMMAND + ".");
+        breaking = false;
+        breakTarget = null;
         laneCounter = 0;
         sendHomeWhenWaitEnds = true;
         waitTicks = Math.max(1, delay);
@@ -263,6 +322,9 @@ public final class NetherFarmClient implements ClientModInitializer {
         laneTicks = 0;
         lanesCompletedThisRun = 0;
         pauseTicks = 0;
+        breaking = false;
+        breakTarget = null;
+        ignoredBreak.clear();
         stuckTicks = 0;
         stuckAnchor = startAlong;
         message(mc, "Parcours lancé : " + LANE_COUNT + " bandes x " + FLOORS
@@ -305,14 +367,37 @@ public final class NetherFarmClient implements ClientModInitializer {
             return;
         }
 
-        player.setXRot(startPitch);
-
         // Obsidienne repérée : fin du parcours, on recommence depuis le /home.
         if (OBSIDIAN_RESTART_ENABLED && obsidianNearby(mc, pos, dirSign)) {
             restartFromHome(mc, "Obsidienne détectée", lanesCompletedThisRun == 0,
                     OBSIDIAN_RESTART_DELAY_TICKS);
             return;
         }
+
+        // Bloc spécial (citrouille dorée) : on s'arrête, on vise, on tape 6 fois, puis on reprend.
+        if (SPECIAL_BREAK_ENABLED) {
+            if (breaking) {
+                handleBreak(mc, player);
+                return;
+            }
+            BlockPos found = findSpecialBlock(mc, player, pos, dirSign);
+            if (found != null) {
+                breaking = true;
+                breakTarget = found;
+                breakClicksDone = 0;
+                breakCooldown = 0;
+                breakSettle = 0;
+                breakRounds = 0;
+                breakAimTicks = 0;
+                message(mc, "Bloc spécial repéré : je le casse (" + BREAK_CLICKS + " coups).");
+                handleBreak(mc, player);
+                return;
+            }
+        }
+
+        // Reprise en douceur de l'inclinaison de départ.
+        player.setXRot(player.getXRot()
+                + Mth.clamp(startPitch - player.getXRot(), -MAX_PITCH_STEP, MAX_PITCH_STEP));
 
         // Montée vers l'étage suivant : on reste en place et on monte.
         if (dy > ALTITUDE_TOLERANCE_UP) {
@@ -378,6 +463,109 @@ public final class NetherFarmClient implements ClientModInitializer {
 
     // =====================================================================================
 
+    private static boolean isSpecial(Block block) {
+        return SPECIAL_BLOCK_IDS.contains(BuiltInRegistries.BLOCK.getKey(block).getPath());
+    }
+
+    /** Cherche un bloc spécial dans ta bande (3 de large), devant et sous toi, à portée de coups. */
+    private static BlockPos findSpecialBlock(Minecraft mc, LocalPlayer player, Vec3 pos, int dirSign) {
+        Vec3 eye = player.getEyePosition();
+        int bx = Mth.floor(pos.x);
+        int by = Mth.floor(pos.y);
+        int bz = Mth.floor(pos.z);
+        int stepX = dirSign * fx;
+        int stepZ = dirSign * fz;
+        BlockPos best = null;
+        double bestDist = Double.MAX_VALUE;
+        for (int n = -1; n <= SPECIAL_SCAN_AHEAD; n++) {
+            for (int m = -1; m <= 1; m++) {
+                for (int dyb = -SPECIAL_SCAN_DOWN; dyb <= 1; dyb++) {
+                    BlockPos bp = new BlockPos(bx + stepX * n + sx * m, by + dyb, bz + stepZ * n + sz * m);
+                    if (ignoredBreak.contains(bp)) continue;
+                    if (!isSpecial(mc.level.getBlockState(bp).getBlock())) continue;
+                    double dx = bp.getX() + 0.5 - eye.x;
+                    double dy = bp.getY() + 0.5 - eye.y;
+                    double dz = bp.getZ() + 0.5 - eye.z;
+                    double dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                    if (dist <= BREAK_REACH && dist < bestDist) {
+                        bestDist = dist;
+                        best = bp;
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    /** Un tick de la séquence : viser le bloc, taper BREAK_CLICKS fois, vérifier, recommencer si besoin. */
+    private static void handleBreak(Minecraft mc, LocalPlayer player) {
+        releaseKeys(mc);
+
+        BlockState st = mc.level.getBlockState(breakTarget);
+        if (st.isAir() || !isSpecial(st.getBlock())) {
+            finishBreak(mc, true);
+            return;
+        }
+
+        // Visée vers le centre du bloc.
+        Vec3 eye = player.getEyePosition();
+        double dx = breakTarget.getX() + 0.5 - eye.x;
+        double dy = breakTarget.getY() + 0.5 - eye.y;
+        double dz = breakTarget.getZ() + 0.5 - eye.z;
+        float wantYaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
+        float wantPitch = (float) -Math.toDegrees(Math.atan2(dy, Math.sqrt(dx * dx + dz * dz)));
+        float dYaw = Mth.wrapDegrees(wantYaw - player.getYRot());
+        float dPitch = wantPitch - player.getXRot();
+        player.setYRot(player.getYRot() + Mth.clamp(dYaw, -MAX_YAW_STEP, MAX_YAW_STEP));
+        player.setXRot(player.getXRot() + Mth.clamp(dPitch, -MAX_PITCH_STEP, MAX_PITCH_STEP));
+        boolean aligned = Math.abs(Mth.wrapDegrees(wantYaw - player.getYRot())) < 1.5f
+                && Math.abs(wantPitch - player.getXRot()) < 1.5f;
+        if (!aligned) return;
+
+        // Le viseur doit vraiment tomber sur le bloc (pas sur une verrue devant).
+        boolean onTarget = mc.hitResult instanceof BlockHitResult hit
+                && hit.getType() == HitResult.Type.BLOCK
+                && hit.getBlockPos().equals(breakTarget);
+        if (!onTarget) {
+            breakAimTicks++;
+            if (breakAimTicks > 40) finishBreak(mc, false);
+            return;
+        }
+        breakAimTicks = 0;
+
+        if (breakCooldown > 0) {
+            breakCooldown--;
+            return;
+        }
+        if (breakClicksDone < BREAK_CLICKS) {
+            KeyMapping.click(LEFT_MOUSE);
+            breakClicksDone++;
+            breakCooldown = BREAK_CLICK_INTERVAL_TICKS;
+            return;
+        }
+        // Série terminée : on laisse 10 ticks au serveur pour répondre, puis on recommence si le bloc est là.
+        if (breakSettle < 10) {
+            breakSettle++;
+            return;
+        }
+        breakRounds++;
+        if (breakRounds >= BREAK_MAX_ROUNDS) {
+            finishBreak(mc, false);
+        } else {
+            breakClicksDone = 0;
+            breakSettle = 0;
+        }
+    }
+
+    private static void finishBreak(Minecraft mc, boolean success) {
+        if (!success && breakTarget != null) ignoredBreak.add(breakTarget);
+        message(mc, success ? "Bloc cassé, je reprends le parcours."
+                : "Bloc non cassé, je l'ignore et je reprends le parcours.");
+        breaking = false;
+        breakTarget = null;
+        stuckTicks = 0;
+    }
+
     /** Du verre dans ta colonne, 1 à END_LOOKAHEAD blocs devant (dans le sens de déplacement) ? */
     private static boolean glassAhead(Minecraft mc, Vec3 pos, int dirSign) {
         int bx = Mth.floor(pos.x);
@@ -437,10 +625,20 @@ public final class NetherFarmClient implements ClientModInitializer {
         mc.options.keyAttack.setDown(attack);
     }
 
+    private static void restorePauseOption(Minecraft mc) {
+        if (pauseOptionChanged) {
+            mc.options.pauseOnLostFocus = previousPauseOnLostFocus;
+            pauseOptionChanged = false;
+        }
+    }
+
     private static void stop(Minecraft mc) {
         running = false;
+        restorePauseOption(mc);
         waitTicks = 0;
         pauseTicks = 0;
+        breaking = false;
+        breakTarget = null;
         sendHomeWhenWaitEnds = false;
         chatMention = false;
         releaseKeys(mc);
