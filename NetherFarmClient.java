@@ -54,7 +54,7 @@ public final class NetherFarmClient implements ClientModInitializer {
     /** Différence de hauteur de vol entre deux étages (en blocs). À ajuster ! */
     private static final double FLOOR_HEIGHT = 4.0;
     /** true = le champ s'étend vers ta droite au départ, false = vers ta gauche. */
-    private static final boolean SHIFT_TO_RIGHT = true;
+    private static final boolean SHIFT_TO_RIGHT = false;
     /** Écart entre deux bandes = largeur de la houe 3x3. */
     private static final double LANE_SPACING = 3.0;
 
