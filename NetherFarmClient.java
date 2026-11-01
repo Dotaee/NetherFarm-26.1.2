@@ -50,7 +50,7 @@ public final class NetherFarmClient implements ClientModInitializer {
     /** Nombre de bandes par étage (largeur du champ / 3). 63 / 3 = 21. */
     private static final int LANE_COUNT = 21;
     /** Nombre d'étages. */
-    private static final int FLOORS = 2;
+    private static final int FLOORS = 1;
     /** Différence de hauteur de vol entre deux étages (en blocs). À ajuster ! */
     private static final double FLOOR_HEIGHT = 4.0;
     /** true = le champ s'étend vers ta droite au départ, false = vers ta gauche. */
