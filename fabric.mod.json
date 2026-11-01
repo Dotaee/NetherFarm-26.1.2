@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "netherfarm",
+  "version": "${version}",
+  "name": "NetherFarm",
+  "description": "Parcourt un champ de nether wart par bandes de 3 blocs (houe 3x3), sur plusieurs étages.",
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["fr.netherfarm.NetherFarmClient"]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.0",
+    "minecraft": "26.1.2",
+    "java": ">=25",
+    "fabric-api": "*"
+  }
+}
