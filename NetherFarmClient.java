@@ -100,11 +100,21 @@ public final class NetherFarmClient implements ClientModInitializer {
     /** Identifiants de blocs (sans "minecraft:") à casser. Touche B = affiche l'identifiant du bloc visé. */
     private static final Set<String> SPECIAL_BLOCK_IDS = Set.of(
             "pumpkin", "carved_pumpkin", "jack_o_lantern", "hay_block", "gold_block");
-    /** Types d'ENTITÉS à casser (sans "minecraft:") : la citrouille dorée n'est pas un bloc. */
-    private static final Set<String> SPECIAL_ENTITY_IDS = Set.of(
-            "interaction", "item_display", "block_display");
-    /** true = toute entité qui brille (contour lumineux) dans ta bande est aussi ciblée. */
-    private static final boolean SPECIAL_GLOWING_ENTITIES = true;
+    /**
+     * Entités à casser, par "signature" = type|largeur|hauteur, comme l'affiche la touche B
+     * (exemple : "interaction|1.0|1.0"). Vide par défaut : utilise V sur une citrouille dorée,
+     * puis envoie-moi la signature pour que je la mette ici définitivement.
+     */
+    private static final Set<String> SPECIAL_ENTITY_SIGNATURES = Set.of();
+    /** Types entiers à casser (sans "minecraft:"), quelle que soit la taille. La citrouille dorée = interaction. */
+    private static final Set<String> SPECIAL_ENTITY_IDS = Set.of("interaction");
+    /**
+     * true = toute entité CLIQUABLE (qui a une hitbox, comme la citrouille dorée) dans ta bande est ciblée,
+     * sauf joueurs et objets au sol. Les affichages purement visuels sans hitbox (verrue brillante) sont ignorés.
+     */
+    private static final boolean SPECIAL_ANY_PICKABLE_ENTITY = false;
+    /** true = toute entité sous le viseur est ciblée (déconseillé). */
+    private static final boolean AUTO_CROSSHAIR_ENTITY = false;
     /** Détection anticipée : le mod repère les entités jusqu'à N blocs devant toi (et un peu derrière). */
     private static final double ENTITY_DETECT_AHEAD = 12.0;
     private static final double ENTITY_DETECT_BEHIND = 6.0;
@@ -252,18 +262,16 @@ public final class NetherFarmClient implements ClientModInitializer {
                 Block b = mc.level.getBlockState(hit.getBlockPos()).getBlock();
                 message(mc, "Bloc visé : " + BuiltInRegistries.BLOCK.getKey(b));
             } else if (mc.hitResult instanceof EntityHitResult eh) {
-                Entity e = eh.getEntity();
-                message(mc, "Entité visée : " + BuiltInRegistries.ENTITY_TYPE.getKey(e.getType())
-                        + (e.isCurrentlyGlowing() ? " (brille)" : ""));
+                message(mc, "Entité visée : " + describeEntity(eh.getEntity()));
             } else {
                 message(mc, "Rien de visé. Entités proches : " + nearbyEntitiesSummary(mc, player));
             }
         }
         while (learnKey.consumeClick()) {
             if (mc.hitResult instanceof EntityHitResult eh) {
-                String id = BuiltInRegistries.ENTITY_TYPE.getKey(eh.getEntity().getType()).getPath();
-                learnedEntityTypes.add(id);
-                message(mc, "Entité « " + id + " » ajoutée aux cibles à casser (jusqu'au redémarrage du jeu).");
+                String sig = entitySignature(eh.getEntity());
+                learnedEntityTypes.add(sig);
+                message(mc, "Cible ajoutée : " + sig + " (valable jusqu'au redémarrage du jeu).");
             } else if (mc.hitResult instanceof BlockHitResult hit && hit.getType() == HitResult.Type.BLOCK) {
                 String id = BuiltInRegistries.BLOCK
                         .getKey(mc.level.getBlockState(hit.getBlockPos()).getBlock()).getPath();
@@ -453,7 +461,8 @@ public final class NetherFarmClient implements ClientModInitializer {
             BlockPos found = findSpecialBlock(mc, player, pos, dirSign);
             Entity foundEntity = (found == null) ? findSpecialEntity(mc, player, pos, dirSign) : null;
             // Automatique : toute entité qui se trouve sous le viseur (hors joueurs et objets au sol).
-            if (found == null && foundEntity == null && mc.hitResult instanceof EntityHitResult eh) {
+            if (AUTO_CROSSHAIR_ENTITY && found == null && foundEntity == null
+                    && mc.hitResult instanceof EntityHitResult eh) {
                 Entity hitE = eh.getEntity();
                 if (!(hitE instanceof Player) && !(hitE instanceof ItemEntity)
                         && !hitE.isRemoved() && !ignoredEntities.contains(hitE.getId())) {
@@ -611,10 +620,15 @@ public final class NetherFarmClient implements ClientModInitializer {
     }
 
     private static boolean isSpecialEntity(Entity e) {
-        if (e instanceof Player || e.isRemoved() || ignoredEntities.contains(e.getId())) return false;
+        if (e instanceof Player || e instanceof ItemEntity || e.isRemoved()
+                || ignoredEntities.contains(e.getId())) return false;
+        // Sans hitbox (affichage visuel seulement, ex. verrue brillante) : on ignore.
+        if (!e.isPickable()) return false;
         String id = BuiltInRegistries.ENTITY_TYPE.getKey(e.getType()).getPath();
-        if (SPECIAL_ENTITY_IDS.contains(id) || learnedEntityTypes.contains(id)) return true;
-        return SPECIAL_GLOWING_ENTITIES && e.isCurrentlyGlowing();
+        if (SPECIAL_ENTITY_IDS.contains(id)) return true;
+        String sig = entitySignature(e);
+        if (SPECIAL_ENTITY_SIGNATURES.contains(sig) || learnedEntityTypes.contains(sig)) return true;
+        return SPECIAL_ANY_PICKABLE_ENTITY;
     }
 
     /** Cherche une entité spéciale dans ta bande (3 de large), devant et sous toi, à portée de coups. */
@@ -647,19 +661,37 @@ public final class NetherFarmClient implements ClientModInitializer {
         return best;
     }
 
-    /** Résumé des types d'entités dans un rayon de 6 blocs (aide à trouver la citrouille dorée). */
+    /** Signature d'une entité : type|largeur|hauteur (une décimale). */
+    private static String entitySignature(Entity e) {
+        return BuiltInRegistries.ENTITY_TYPE.getKey(e.getType()).getPath()
+                + "|" + String.format(Locale.ROOT, "%.1f", e.getBbWidth())
+                + "|" + String.format(Locale.ROOT, "%.1f", e.getBbHeight());
+    }
+
+    private static String describeEntity(Entity e) {
+        StringBuilder sb = new StringBuilder(entitySignature(e));
+        sb.append(e.isPickable() ? " cliquable" : " non-cliquable");
+        if (e.isCurrentlyGlowing()) sb.append(" brille");
+        if (e.getCustomName() != null) sb.append(" nom=").append(e.getCustomName().getString());
+        return sb.toString();
+    }
+
+    /** Les entités les plus proches (rayon 8 blocs), avec leur signature, pour identifier la citrouille. */
     private static String nearbyEntitiesSummary(Minecraft mc, LocalPlayer player) {
-        java.util.Map<String, Integer> counts = new java.util.TreeMap<>();
+        java.util.List<Entity> list = new java.util.ArrayList<>();
         for (Entity e : mc.level.entitiesForRendering()) {
             if (e == player || e instanceof Player) continue;
-            if (e.distanceTo(player) > 6.0f) continue;
-            counts.merge(BuiltInRegistries.ENTITY_TYPE.getKey(e.getType()).getPath(), 1, Integer::sum);
+            if (e.distanceTo(player) > 8.0f) continue;
+            list.add(e);
         }
-        if (counts.isEmpty()) return "aucune";
+        if (list.isEmpty()) return "aucune";
+        list.sort(java.util.Comparator.comparingDouble(en -> en.distanceTo(player)));
         StringBuilder sb = new StringBuilder();
-        for (java.util.Map.Entry<String, Integer> en : counts.entrySet()) {
-            if (sb.length() > 0) sb.append(", ");
-            sb.append(en.getKey()).append(" x").append(en.getValue());
+        int n = 0;
+        for (Entity e : list) {
+            if (n++ >= 6) break;
+            if (sb.length() > 0) sb.append(" ; ");
+            sb.append(describeEntity(e));
         }
         return sb.toString();
     }
