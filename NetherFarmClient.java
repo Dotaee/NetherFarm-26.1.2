@@ -74,6 +74,16 @@ public final class NetherFarmClient implements ClientModInitializer {
     /** Retours au /home de suite, sans aucune bande terminée, avant arrêt définitif. */
     private static final int MAX_BAD_RESTARTS = 3;
 
+    // ---- Obsidienne = fin du parcours : retour au /home et nouveau tour ----
+    private static final boolean OBSIDIAN_RESTART_ENABLED = true;
+    private static final int OBSIDIAN_RESTART_DELAY_TICKS = 10;  // 0,5 s avant de refaire /home
+    /** Distance scannée sur le côté (vers la bande suivante) pour repérer l'obsidienne. */
+    private static final int OBSIDIAN_SIDE_SCAN = 4;
+
+    // ---- Vitesse ----
+    /** true = le joueur sprinte pendant les bandes (vole plus vite). */
+    private static final boolean SPRINT_ENABLED = true;
+
     // ---- Commandes périodiques (en alternance) ----
     private static final boolean PERIODIC_COMMANDS_ENABLED = true;
     /** Une commande toutes les N bandes terminées. */
@@ -297,6 +307,13 @@ public final class NetherFarmClient implements ClientModInitializer {
 
         player.setXRot(startPitch);
 
+        // Obsidienne repérée : fin du parcours, on recommence depuis le /home.
+        if (OBSIDIAN_RESTART_ENABLED && obsidianNearby(mc, pos, dirSign)) {
+            restartFromHome(mc, "Obsidienne détectée", lanesCompletedThisRun == 0,
+                    OBSIDIAN_RESTART_DELAY_TICKS);
+            return;
+        }
+
         // Montée vers l'étage suivant : on reste en place et on monte.
         if (dy > ALTITUDE_TOLERANCE_UP) {
             setKeys(mc, false, false, false, true, false, false);
@@ -377,6 +394,31 @@ public final class NetherFarmClient implements ClientModInitializer {
         return false;
     }
 
+    /** Obsidienne devant toi dans la bande, ou sur le côté (là où se trouve la bande suivante). */
+    private static boolean obsidianNearby(Minecraft mc, Vec3 pos, int dirSign) {
+        int bx = Mth.floor(pos.x);
+        int by = Mth.floor(pos.y);
+        int bz = Mth.floor(pos.z);
+        int stepX = dirSign * fx;
+        int stepZ = dirSign * fz;
+        for (int dyb = -END_SCAN_DOWN; dyb <= END_SCAN_UP; dyb++) {
+            for (int n = 1; n <= END_LOOKAHEAD; n++) {
+                if (isObsidian(mc.level.getBlockState(
+                        new BlockPos(bx + stepX * n, by + dyb, bz + stepZ * n)).getBlock())) return true;
+            }
+            for (int n = 1; n <= OBSIDIAN_SIDE_SCAN; n++) {
+                if (isObsidian(mc.level.getBlockState(
+                        new BlockPos(bx + sx * n, by + dyb, bz + sz * n)).getBlock())) return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isObsidian(Block block) {
+        String path = BuiltInRegistries.BLOCK.getKey(block).getPath();
+        return path.equals("obsidian") || path.equals("crying_obsidian");
+    }
+
     private static boolean isGlass(Block block) {
         String path = BuiltInRegistries.BLOCK.getKey(block).getPath();
         return path.equals("glass") || path.endsWith("_glass")
@@ -386,6 +428,7 @@ public final class NetherFarmClient implements ClientModInitializer {
     private static void setKeys(Minecraft mc, boolean forward, boolean left, boolean right,
                                 boolean up, boolean down, boolean attack) {
         mc.options.keyUp.setDown(forward);
+        mc.options.keySprint.setDown(SPRINT_ENABLED && forward);
         mc.options.keyDown.setDown(false);
         mc.options.keyLeft.setDown(left);
         mc.options.keyRight.setDown(right);
@@ -405,6 +448,7 @@ public final class NetherFarmClient implements ClientModInitializer {
 
     private static void releaseKeys(Minecraft mc) {
         mc.options.keyUp.setDown(false);
+        mc.options.keySprint.setDown(false);
         mc.options.keyDown.setDown(false);
         mc.options.keyLeft.setDown(false);
         mc.options.keyRight.setDown(false);
