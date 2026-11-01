@@ -1,0 +1,30 @@
+name: Build NetherFarm
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assembler le projet
+        run: |
+          mkdir -p nf/src/main/java/fr/netherfarm
+          mkdir -p nf/src/main/resources/assets/netherfarm/lang
+          cp build.gradle gradle.properties settings.gradle nf/
+          cp NetherFarmClient.java nf/src/main/java/fr/netherfarm/
+          cp fabric.mod.json nf/src/main/resources/
+          cp en_us.json fr_fr.json nf/src/main/resources/assets/netherfarm/lang/
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 25
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: current
+      - run: gradle build
+        working-directory: nf
+      - uses: actions/upload-artifact@v4
+        with:
+          name: netherfarm
+          path: nf/build/libs/*.jar
