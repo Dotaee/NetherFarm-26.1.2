@@ -47,8 +47,8 @@ public final class NetherFarmClient implements ClientModInitializer {
     private static final int HOME_WAIT_TICKS = 60;           // 3 s d'attente après la commande
 
     // ---- Réglages du champ ----
-    /** Nombre de bandes par étage (largeur du champ / 3). 63 / 3 = 21. */
-    private static final int LANE_COUNT = 21;
+    /** Nombre de bandes par étage (largeur du champ / 3). 87 / 3 = 29. */
+    private static final int LANE_COUNT = 29;
     /** Nombre d'étages. */
     private static final int FLOORS = 1;
     /** Différence de hauteur de vol entre deux étages (en blocs). À ajuster ! */
@@ -74,6 +74,15 @@ public final class NetherFarmClient implements ClientModInitializer {
     /** Retours au /home de suite, sans aucune bande terminée, avant arrêt définitif. */
     private static final int MAX_BAD_RESTARTS = 3;
 
+    // ---- Commandes périodiques (en alternance) ----
+    private static final boolean PERIODIC_COMMANDS_ENABLED = true;
+    /** Une commande toutes les N bandes terminées. */
+    private static final int COMMAND_EVERY_LANES = 10;
+    private static final String COMMAND_A = "sell all";   // sans le "/"
+    private static final String COMMAND_B = "feed";       // sans le "/"
+    /** Courte pause après la commande, pour laisser le serveur répondre. */
+    private static final int COMMAND_PAUSE_TICKS = 20;
+
     // ---- Sécurité / pilotage ----
     private static final float MIN_HEALTH = 6.0f;            // 3 coeurs
     private static final boolean STOP_ON_CHAT_MENTION = true;
@@ -92,6 +101,8 @@ public final class NetherFarmClient implements ClientModInitializer {
     private static int laneCounter = 0;
     private static int laneTicks = 0;
     private static int lanesCompletedThisRun = 0;
+    private static int pauseTicks = 0;
+    private static boolean nextCommandIsA = true;
     private static int badRestarts = 0;
     private static int stuckTicks = 0;
     private static double stuckAnchor = 0;
@@ -174,6 +185,12 @@ public final class NetherFarmClient implements ClientModInitializer {
             return;
         }
 
+        if (pauseTicks > 0) {
+            releaseKeys(mc);
+            pauseTicks--;
+            return;
+        }
+
         runTick(mc, player);
     }
 
@@ -195,6 +212,16 @@ public final class NetherFarmClient implements ClientModInitializer {
         laneCounter = 0;
         sendHomeWhenWaitEnds = true;
         waitTicks = Math.max(1, delay);
+    }
+
+    /** Envoie /sell all puis /feed puis /sell all... une à chaque appel. */
+    private static void sendPeriodicCommand(Minecraft mc) {
+        String cmd = nextCommandIsA ? COMMAND_A : COMMAND_B;
+        nextCommandIsA = !nextCommandIsA;
+        ClientPacketListener connection = mc.getConnection();
+        if (connection != null) connection.sendCommand(cmd);
+        pauseTicks = COMMAND_PAUSE_TICKS;
+        message(mc, "Bande " + laneCounter + " terminée : /" + cmd + " envoyé.");
     }
 
     private static void sendHome(Minecraft mc) {
@@ -225,6 +252,7 @@ public final class NetherFarmClient implements ClientModInitializer {
         laneCounter = 0;
         laneTicks = 0;
         lanesCompletedThisRun = 0;
+        pauseTicks = 0;
         stuckTicks = 0;
         stuckAnchor = startAlong;
         message(mc, "Parcours lancé : " + LANE_COUNT + " bandes x " + FLOORS
@@ -307,6 +335,10 @@ public final class NetherFarmClient implements ClientModInitializer {
             stuckTicks = 0;
             stuckAnchor = along;
             setKeys(mc, false, false, false, false, false, false);
+            if (PERIODIC_COMMANDS_ENABLED && laneCounter % COMMAND_EVERY_LANES == 0
+                    && laneCounter < totalLanes) {
+                sendPeriodicCommand(mc);
+            }
             return;
         }
 
@@ -365,6 +397,7 @@ public final class NetherFarmClient implements ClientModInitializer {
     private static void stop(Minecraft mc) {
         running = false;
         waitTicks = 0;
+        pauseTicks = 0;
         sendHomeWhenWaitEnds = false;
         chatMention = false;
         releaseKeys(mc);
