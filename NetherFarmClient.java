@@ -24,7 +24,6 @@ import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.inventory.AbstractContainerMenu;
-import net.minecraft.world.inventory.ClickType;
 import net.minecraft.world.inventory.Slot;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.Block;
@@ -170,24 +169,14 @@ public final class NetherFarmClient implements ClientModInitializer {
     /** true = quand un menu de serveur s'ouvre pendant le farm, le chat liste son contenu (une fois). */
     private static final boolean DUMP_CONTAINER_SCREENS = true;
 
-    // ---- Tirage de cartes automatique ----
+    // ---- Fermeture automatique des menus ----
     /** true = ferme tout menu qui s'ouvre pendant le farm, comme si tu appuyais sur Échap. */
     private static final boolean AUTO_CLOSE_MENUS = true;
     private static final int AUTO_CLOSE_MIN_TICKS = 20;      // délai minimum avant de fermer (1 s)
     private static final int AUTO_CLOSE_JITTER_TICKS = 14;   // + 0 à 0,7 s au hasard
-    /** Tirage de cartes par clics : désactivé tant que la fermeture suffit. */
-    private static final boolean CARD_AUTO_ENABLED = false;
-    /** true = les cartes sont aussi tirées quand le farm est arrêté (menu ouvert à la main, par exemple). */
-    private static final boolean CARD_WHEN_IDLE = true;
     /** true = pendant le farm, le chat annonce chaque nouvel écran ouvert (type et titre) pour le diagnostic. */
     private static final boolean DEBUG_SCREENS = true;
-    private static final String VERSION_TAG = "v1.1 fermeture des menus";
-    /** Mots (en minuscules) qui identifient un menu de cartes : dans le titre du menu ou le nom des cartes. */
-    private static final String[] CARD_KEYWORDS = {"carte", "card", "podium"};
-    /** true = clique sur le butin apparu (shift-clic) avant de fermer. */
-    private static final boolean CARD_CLAIM_LOOT = true;
-    /** true = ferme le menu à la fin pour que le farm reprenne tout seul. */
-    private static final boolean CARD_AUTO_CLOSE = true;
+    private static final String VERSION_TAG = "v1.2 fermeture des menus";
 
     // ---- Fenêtre en arrière-plan ----
     /** true = le menu du jeu ne s'ouvre plus quand tu quittes la fenêtre, et le mod continue de tourner. */
@@ -241,19 +230,6 @@ public final class NetherFarmClient implements ClientModInitializer {
     private static int breakSettle = 0;
     private static int breakRounds = 0;
     private static int breakAimTicks = 0;
-    private static Screen cardScreen = null;
-    private static int cardPhase = 0;
-    private static int cardWait = 0;
-    private static int cardClicked = -1;
-    private static int cardFails = 0;
-    private static int cardFlips = 0;
-    private static int cardLootIndex = 0;
-    private static boolean cardDone = false;
-    private static final List<Integer> cardSlots = new ArrayList<>();
-    private static final Map<Integer, String> cardSig = new HashMap<>();
-    private static final Set<Integer> cardTried = new HashSet<>();
-    private static final Set<Integer> cardEmptyAtStart = new TreeSet<>();
-    private static final List<Integer> cardLoot = new ArrayList<>();
     private static Screen closeScreen = null;
     private static int closeWait = 0;
     private static boolean closeDone = false;
@@ -368,7 +344,6 @@ public final class NetherFarmClient implements ClientModInitializer {
             if (running && DEBUG_SCREENS) debugScreenIfNew(mc);
             if (running && DUMP_CONTAINER_SCREENS) dumpContainerIfNew(mc, player);
             if (running && AUTO_CLOSE_MENUS) autoCloseMenu(mc);
-            if (CARD_AUTO_ENABLED && (running || CARD_WHEN_IDLE)) handleCardScreen(mc, player, running);
         }
 
         while (holdKey.consumeClick()) {
@@ -501,163 +476,6 @@ public final class NetherFarmClient implements ClientModInitializer {
         debugScreen = sc;
         if (sc instanceof ChatScreen || sc instanceof PauseScreen || sc instanceof InventoryScreen) return;
         message(mc, "Écran ouvert : " + sc.getClass().getSimpleName() + " « " + sc.getTitle().getString() + " »");
-    }
-
-    private static String stackSig(ItemStack st) {
-        if (st.isEmpty()) return "vide";
-        return BuiltInRegistries.ITEM.getKey(st.getItem()).getPath() + "|" + st.getHoverName().getString()
-                + "|" + st.getCount();
-    }
-
-    private static boolean containsKeyword(String text) {
-        for (String k : CARD_KEYWORDS) {
-            if (text.contains(k)) return true;
-        }
-        return false;
-    }
-
-    private static void clickSlot(Minecraft mc, LocalPlayer player, AbstractContainerMenu menu,
-                                  int slot, ClickType type) {
-        if (mc.gameMode != null) {
-            mc.gameMode.handleInventoryMouseClick(menu.containerId, slot, 0, type, player);
-        }
-    }
-
-    /**
-     * Tirage de cartes : repère les cartes (objets identiques, face cachée), en retourne une à la fois
-     * avec des délais variables, s'arrête quand plus aucune ne se retourne, récupère le butin, ferme le menu.
-     * Ne fait rien si le menu n'est pas reconnu comme un menu de cartes.
-     */
-    private static void handleCardScreen(Minecraft mc, LocalPlayer player, boolean verbose) {
-        Screen sc = mc.screen;
-        if (!(sc instanceof AbstractContainerScreen<?> cs) || sc instanceof InventoryScreen) return;
-        if (sc != cardScreen) {
-            cardScreen = sc;
-            cardPhase = 0;
-            cardWait = 15 + RNG.nextInt(8);
-            cardDone = false;
-            cardSlots.clear();
-            cardSig.clear();
-            cardTried.clear();
-            cardEmptyAtStart.clear();
-            cardLoot.clear();
-            cardFails = 0;
-            cardFlips = 0;
-            cardLootIndex = 0;
-        }
-        if (cardDone) return;
-        AbstractContainerMenu menu = cs.getMenu();
-
-        switch (cardPhase) {
-            case 0 -> {
-                if (--cardWait > 0) return;
-                Map<String, List<Integer>> groups = new LinkedHashMap<>();
-                for (int i = 0; i < menu.slots.size(); i++) {
-                    Slot sl = menu.slots.get(i);
-                    if (sl.container == player.getInventory()) continue;
-                    ItemStack st = sl.getItem();
-                    if (st.isEmpty()) {
-                        cardEmptyAtStart.add(i);
-                        continue;
-                    }
-                    groups.computeIfAbsent(stackSig(st), k -> new ArrayList<>()).add(i);
-                }
-                boolean titleMatch = containsKeyword(sc.getTitle().getString().toLowerCase(Locale.ROOT));
-                List<Integer> best = null;
-                boolean bestKeyword = false;
-                for (List<Integer> g : groups.values()) {
-                    if (g.size() < 2 || g.size() > 8) continue;
-                    String name = menu.slots.get(g.get(0)).getItem().getHoverName().getString()
-                            .toLowerCase(Locale.ROOT);
-                    if (name.isBlank()) continue;
-                    boolean kw = containsKeyword(name);
-                    if (best == null || (kw && !bestKeyword) || (kw == bestKeyword && g.size() > best.size())) {
-                        best = g;
-                        bestKeyword = kw;
-                    }
-                }
-                if (best == null || !(titleMatch || bestKeyword)) {
-                    cardDone = true;
-                    if (verbose) message(mc, "Menu non reconnu comme un tirage de cartes : je te laisse la main.");
-                    return;
-                }
-                cardSlots.addAll(best);
-                for (int i : best) cardSig.put(i, stackSig(menu.slots.get(i).getItem()));
-                cardPhase = 1;
-                cardWait = 10 + RNG.nextInt(13);
-                message(mc, "Tirage de cartes : " + best.size() + " cartes détectées, je les retourne.");
-            }
-            case 1 -> {
-                if (--cardWait > 0) return;
-                List<Integer> available = new ArrayList<>();
-                for (int i : cardSlots) {
-                    if (!cardTried.contains(i)
-                            && stackSig(menu.slots.get(i).getItem()).equals(cardSig.get(i))) {
-                        available.add(i);
-                    }
-                }
-                if (available.isEmpty()) {
-                    cardPhase = 3;
-                    cardWait = 15 + RNG.nextInt(16);
-                    return;
-                }
-                int pick = available.get(RNG.nextInt(available.size()));
-                clickSlot(mc, player, menu, pick, ClickType.PICKUP);
-                cardClicked = pick;
-                cardPhase = 2;
-                cardWait = 18 + RNG.nextInt(8);
-            }
-            case 2 -> {
-                if (--cardWait > 0) return;
-                cardTried.add(cardClicked);
-                if (!stackSig(menu.slots.get(cardClicked).getItem()).equals(cardSig.get(cardClicked))) {
-                    cardFlips++;
-                    cardFails = 0;
-                } else {
-                    cardFails++;
-                }
-                if (cardFails >= 2) {
-                    cardPhase = 3;
-                    cardWait = 15 + RNG.nextInt(16);
-                } else {
-                    cardPhase = 1;
-                    cardWait = 8 + RNG.nextInt(13);
-                }
-            }
-            case 3 -> {
-                if (--cardWait > 0) return;
-                cardLoot.clear();
-                if (CARD_CLAIM_LOOT) {
-                    for (int i : cardEmptyAtStart) {
-                        if (!menu.slots.get(i).getItem().isEmpty()) cardLoot.add(i);
-                    }
-                }
-                cardLootIndex = 0;
-                cardPhase = 4;
-                cardWait = 6 + RNG.nextInt(8);
-                message(mc, "Cartes retournées : " + cardFlips + ".");
-            }
-            case 4 -> {
-                if (--cardWait > 0) return;
-                if (cardLootIndex < cardLoot.size()) {
-                    clickSlot(mc, player, menu, cardLoot.get(cardLootIndex++), ClickType.QUICK_MOVE);
-                    cardWait = 6 + RNG.nextInt(9);
-                    return;
-                }
-                cardPhase = 5;
-                cardWait = 20 + RNG.nextInt(15);
-            }
-            default -> {
-                if (--cardWait > 0) return;
-                cardDone = true;
-                if (CARD_AUTO_CLOSE) {
-                    message(mc, "Tirage terminé : je ferme le menu et je reprends le farm.");
-                    player.closeContainer();
-                } else {
-                    message(mc, "Tirage terminé : ferme le menu pour reprendre le farm.");
-                }
-            }
-        }
     }
 
     /** Liste (une fois) le contenu d'un menu de serveur : emplacement, objet, nom. Pour configurer le tirage. */
