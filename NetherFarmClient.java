@@ -20,10 +20,12 @@ import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
 import net.minecraft.util.Mth;
+import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.inventory.AbstractContainerMenu;
+import net.minecraft.world.inventory.ContainerInput;
 import net.minecraft.world.inventory.Slot;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.Block;
@@ -134,12 +136,27 @@ public final class NetherFarmClient implements ClientModInitializer {
     /** Largeur de détection de chaque côté de ta ligne (couvre un 3x3 devant toi). */
     private static final double ENTITY_DETECT_SIDE = 2.5;
     /** Zone verticale de détection par rapport à toi (évite les cibles d'un autre étage). */
-    private static final double ENTITY_DETECT_DOWN = 4.5;
+    private static final double ENTITY_DETECT_DOWN = 7.0;
     private static final double ENTITY_DETECT_UP = 2.0;
     /** Ignore les cibles cachées derrière des blocs (autre étage, murs). */
     private static final boolean REQUIRE_LINE_OF_SIGHT = true;
     /** Ignore les `interaction` sans visuel à côté (entité invisible qui ne correspond à aucune citrouille). */
     private static final boolean REQUIRE_VISUAL_NEARBY = true;
+    /**
+     * true = les coups sur une entité sont envoyés directement au serveur (attaque + balancement du bras),
+     * sans dépendre du viseur ni de la touche attaquer. false = clics simulés comme avant.
+     */
+    private static final boolean BREAK_DIRECT_ATTACK = true;
+    /** Distance max (yeux -> bord de la hitbox) pour frapper une entité en attaque directe (portée du jeu : 3). */
+    private static final double BREAK_DIRECT_RANGE = 2.6;
+    /** Vitesse (blocs/tick) en dessous de laquelle on considère le joueur immobile avant de frapper. */
+    private static final double STILL_SPEED = 0.05;
+    /** Nombre de ticks consécutifs d'immobilité exigés avant le premier coup. */
+    private static final int STILL_TICKS_REQUIRED = 3;
+    /** Durée (ticks) pendant laquelle une cible qu'on n'a pas réussi à casser est ignorée (30 s). */
+    private static final int IGNORE_TICKS = 600;
+    /** Affiche dans le chat pourquoi une `interaction` proche n'a pas été retenue (une fois par entité). */
+    private static final boolean DEBUG_REJECTS = true;
     /** Affiche dans le chat chaque cible choisie (type, taille, distance) pour comprendre ce qu'il vise. */
     private static final boolean DEBUG_TARGETS = true;
     /** Temps max (ticks) passé sur une même cible, approche comprise, avant de l'abandonner. */
@@ -167,7 +184,21 @@ public final class NetherFarmClient implements ClientModInitializer {
 
     // ---- Menus du serveur (ex. tirage de cartes) ----
     /** true = quand un menu de serveur s'ouvre pendant le farm, le chat liste son contenu (une fois). */
-    private static final boolean DUMP_CONTAINER_SCREENS = true;
+    private static final boolean DUMP_CONTAINER_SCREENS = false;
+
+    // ---- Tirage de cartes (menu « Cartes du podium ») ----
+    /** true = retourne les cartes puis ferme le menu. false = ferme seulement (fermeture automatique). */
+    private static final boolean CARD_AUTO_ENABLED = true;
+    /** true = les cartes sont aussi tirées quand le farm est arrêté (menu ouvert à la main). */
+    private static final boolean CARD_WHEN_IDLE = true;
+    /** true = ferme le menu (Échap) quand toutes les cartes sont retournées. */
+    private static final boolean CARD_AUTO_CLOSE = true;
+    /** Colonnes des 5 cartes dans le menu (cartes sur les rangées 1 à 3 ; on clique la rangée du milieu). */
+    private static final int[] CARD_COLUMNS = {0, 2, 4, 6, 8};
+    private static final int CARD_CLICK_ROW = 2;
+    /** Attente (ticks) d'une réaction du serveur après un clic, avant d'essayer une autre carte. */
+    private static final int CARD_RESULT_TIMEOUT = 40;
+    private static final int CARD_MAX_FAILS = 4;
 
     // ---- Fermeture automatique des menus ----
     /** true = ferme tout menu qui s'ouvre pendant le farm, comme si tu appuyais sur Échap. */
@@ -175,8 +206,8 @@ public final class NetherFarmClient implements ClientModInitializer {
     private static final int AUTO_CLOSE_MIN_TICKS = 20;      // délai minimum avant de fermer (1 s)
     private static final int AUTO_CLOSE_JITTER_TICKS = 14;   // + 0 à 0,7 s au hasard
     /** true = pendant le farm, le chat annonce chaque nouvel écran ouvert (type et titre) pour le diagnostic. */
-    private static final boolean DEBUG_SCREENS = true;
-    private static final String VERSION_TAG = "v1.2 fermeture des menus";
+    private static final boolean DEBUG_SCREENS = false;
+    private static final String VERSION_TAG = "v1.3 cartes + fermeture";
 
     // ---- Fenêtre en arrière-plan ----
     /** true = le menu du jeu ne s'ouvre plus quand tu quittes la fenêtre, et le mod continue de tourner. */
@@ -219,7 +250,9 @@ public final class NetherFarmClient implements ClientModInitializer {
     private static boolean breaking = false;
     private static BlockPos breakTarget = null;
     private static Entity breakEntity = null;
-    private static final Set<Integer> ignoredEntities = new HashSet<>();
+    private static long gameTicks = 0;
+    private static final java.util.Map<Integer, Long> ignoredEntities = new java.util.HashMap<>();
+    private static final Set<Integer> rejectLogged = new HashSet<>();
     private static final Set<String> learnedEntityTypes = new HashSet<>();
     private static final Set<String> learnedBlockIds = new HashSet<>();
     private static KeyMapping learnKey;
@@ -230,6 +263,16 @@ public final class NetherFarmClient implements ClientModInitializer {
     private static int breakSettle = 0;
     private static int breakRounds = 0;
     private static int breakAimTicks = 0;
+    private static Screen cardScreen = null;
+    private static int cardWait = 0;
+    private static int cardWatch = 0;
+    private static int cardFails = 0;
+    private static int cardInPlace = 0;
+    private static int cardInitialN = -1;
+    private static int clickedSlot = -1;
+    private static boolean cardDone = false;
+    private static boolean cardAnnounced = false;
+    private static final Set<Integer> cardBadSlots = new HashSet<>();
     private static Screen closeScreen = null;
     private static int closeWait = 0;
     private static boolean closeDone = false;
@@ -239,8 +282,9 @@ public final class NetherFarmClient implements ClientModInitializer {
     private static boolean dumped = false;
     private static int breakApproachTicks = 0;
     private static int breakTotalTicks = 0;
+    private static int breakStillTicks = 0;
     private static int specialPauseTicks = 0;
-    private static final Set<Long> ignoredEntityPositions = new HashSet<>();
+    private static final java.util.Map<Long, Long> ignoredEntityPositions = new java.util.HashMap<>();
     private static boolean chainActive = false;
     private static int chainCount = 0;
     private static final Set<BlockPos> ignoredBreak = new HashSet<>();
@@ -293,6 +337,7 @@ public final class NetherFarmClient implements ClientModInitializer {
             return;
         }
 
+        gameTicks++;
         while (toggleKey.consumeClick()) {
             if (running) {
                 stop(mc);
@@ -343,6 +388,7 @@ public final class NetherFarmClient implements ClientModInitializer {
         if (mc.screen != null) {
             if (running && DEBUG_SCREENS) debugScreenIfNew(mc);
             if (running && DUMP_CONTAINER_SCREENS) dumpContainerIfNew(mc, player);
+            if (CARD_AUTO_ENABLED && (running || CARD_WHEN_IDLE)) handleCardScreen(mc, player);
             if (running && AUTO_CLOSE_MENUS) autoCloseMenu(mc);
         }
 
@@ -456,6 +502,7 @@ public final class NetherFarmClient implements ClientModInitializer {
     private static void autoCloseMenu(Minecraft mc) {
         Screen sc = mc.screen;
         if (sc instanceof ChatScreen || sc instanceof PauseScreen || sc instanceof InventoryScreen) return;
+        if (CARD_AUTO_ENABLED && isCardMenu(sc)) return;   // le tirage de cartes ferme lui-même le menu
         if (!sc.shouldCloseOnEsc()) return;   // écrans qu'Échap ne ferme pas (mort, etc.)
         if (sc != closeScreen) {
             closeScreen = sc;
@@ -468,6 +515,143 @@ public final class NetherFarmClient implements ClientModInitializer {
         message(mc, "Menu fermé (Échap) : " + sc.getClass().getSimpleName()
                 + " « " + sc.getTitle().getString() + " ». Le farm reprend.");
         sc.onClose();
+    }
+
+    private static String normTitle(Screen sc) {
+        return sc.getTitle().getString().toLowerCase(Locale.ROOT).replaceAll("\\s+", "");
+    }
+
+    /** Le menu « Cartes du podium » : conteneur dont le titre contient « carte » et « podium ». */
+    private static boolean isCardMenu(Screen sc) {
+        if (!(sc instanceof AbstractContainerScreen<?>) || sc instanceof InventoryScreen) return false;
+        String t = normTitle(sc);
+        return t.contains("carte") && t.contains("podium");
+    }
+
+    /** Nombre de cartes restant à retourner, lu dans le titre (« 2 cartes à retourner »). 0 si absent. */
+    private static int cardRemaining(Screen sc) {
+        String t = normTitle(sc);
+        int idx = t.indexOf("retourner");
+        if (idx < 0) return 0;
+        int end = idx;
+        while (end > 0 && !Character.isDigit(t.charAt(end - 1))) end--;
+        int start = end;
+        while (start > 0 && Character.isDigit(t.charAt(start - 1))) start--;
+        if (start == end) return 1;
+        try {
+            return Integer.parseInt(t.substring(start, end));
+        } catch (NumberFormatException ex) {
+            return 1;
+        }
+    }
+
+    private static String cardSlotName(AbstractContainerMenu menu, int slot) {
+        if (slot < 0 || slot >= menu.slots.size()) return "";
+        return menu.slots.get(slot).getItem().getHoverName().getString().toLowerCase(Locale.ROOT);
+    }
+
+    private static void clickSlot(Minecraft mc, LocalPlayer player, AbstractContainerMenu menu, int slot) {
+        if (mc.gameMode != null) {
+            mc.gameMode.handleInventoryMouseClick(menu.containerId, slot, 0, ContainerInput.PICKUP, player);
+        }
+    }
+
+    /**
+     * Menu « Cartes du podium » : lit le nombre de cartes à retourner dans le titre, clique une carte
+     * non retournée (au hasard, avec des délais variables), attend la réponse du serveur, recommence,
+     * puis ferme le menu avec Échap quand il n'en reste plus.
+     */
+    private static void handleCardScreen(Minecraft mc, LocalPlayer player) {
+        Screen sc = mc.screen;
+        if (!isCardMenu(sc)) return;
+        AbstractContainerMenu menu = ((AbstractContainerScreen<?>) sc).getMenu();
+
+        if (sc != cardScreen) {   // nouvel écran : ouverture, ou mise à jour envoyée par le serveur
+            cardScreen = sc;
+            cardWait = 12 + RNG.nextInt(14);
+            cardWatch = 0;
+            cardInPlace = 0;
+            clickedSlot = -1;
+            cardDone = false;
+            cardBadSlots.clear();
+            if (cardWatch == 0) cardFails = 0;
+        }
+        if (cardDone) return;
+
+        if (cardWatch > 0) {   // on attend la réaction du serveur au dernier clic
+            if (clickedSlot >= 0 && cardSlotName(menu, clickedSlot).contains("belle")) {
+                cardInPlace++;
+                cardWatch = 0;
+                cardFails = 0;
+                cardWait = 8 + RNG.nextInt(14);
+                clickedSlot = -1;
+                return;
+            }
+            if (--cardWatch > 0) return;
+            if (clickedSlot >= 0) cardBadSlots.add(clickedSlot);
+            clickedSlot = -1;
+            cardFails++;
+            cardWait = 6 + RNG.nextInt(8);
+        }
+        if (cardWait > 0) {
+            cardWait--;
+            return;
+        }
+
+        // Cartes déjà retournées (nom « belle ») : on ne dépend pas seulement du titre, que le serveur
+        // peut mettre à jour ou non après chaque clic.
+        int flippedNow = 0;
+        for (int col : CARD_COLUMNS) {
+            if (cardSlotName(menu, CARD_CLICK_ROW * 9 + col).contains("belle")) flippedNow++;
+        }
+        int titleRemaining = cardRemaining(sc);
+        if (cardInitialN < 0 && titleRemaining > 0) cardInitialN = titleRemaining + flippedNow;
+        int remaining = titleRemaining;
+        if (cardInitialN >= 0) remaining = Math.min(titleRemaining, cardInitialN - flippedNow);
+        if (remaining <= 0) {
+            cardDone = true;
+            cardAnnounced = false;
+            cardInitialN = -1;
+            if (CARD_AUTO_CLOSE) {
+                message(mc, "Cartes retournées : je ferme le menu et le farm reprend.");
+                sc.onClose();
+            } else {
+                message(mc, "Cartes retournées : ferme le menu pour reprendre le farm.");
+            }
+            return;
+        }
+        if (!cardAnnounced) {
+            cardAnnounced = true;
+            message(mc, "Cartes du podium : " + remaining + " carte(s) à retourner.");
+        }
+        if (cardFails >= CARD_MAX_FAILS) {
+            cardDone = true;
+            cardAnnounced = false;
+            cardInitialN = -1;
+            message(mc, "Je n'arrive pas à retourner les cartes : je ferme le menu.");
+            sc.onClose();
+            return;
+        }
+
+        List<Integer> options = new ArrayList<>();
+        for (int col : CARD_COLUMNS) {
+            int slot = CARD_CLICK_ROW * 9 + col;
+            if (cardBadSlots.contains(slot)) continue;
+            if (cardSlotName(menu, slot).contains("belle")) continue;   // déjà retournée
+            options.add(slot);
+        }
+        if (options.isEmpty()) {
+            cardDone = true;
+            cardAnnounced = false;
+            cardInitialN = -1;
+            message(mc, "Plus aucune carte à cliquer : je ferme le menu.");
+            sc.onClose();
+            return;
+        }
+        int pick = options.get(RNG.nextInt(options.size()));
+        clickSlot(mc, player, menu, pick);
+        clickedSlot = pick;
+        cardWatch = CARD_RESULT_TIMEOUT;
     }
 
     private static void debugScreenIfNew(Minecraft mc) {
@@ -553,6 +737,7 @@ public final class NetherFarmClient implements ClientModInitializer {
         ignoredBreak.clear();
         ignoredEntities.clear();
         ignoredEntityPositions.clear();
+        rejectLogged.clear();
         specialPauseTicks = 0;
         stuckTicks = 0;
         stuckAnchor = startAlong;
@@ -622,7 +807,8 @@ public final class NetherFarmClient implements ClientModInitializer {
                     && mc.hitResult instanceof EntityHitResult eh) {
                 Entity hitE = eh.getEntity();
                 if (!(hitE instanceof Player) && !(hitE instanceof ItemEntity)
-                        && !hitE.isRemoved() && !ignoredEntities.contains(hitE.getId())) {
+                        && !hitE.isRemoved()
+                        && !(ignoredEntities.getOrDefault(hitE.getId(), 0L) > gameTicks)) {
                     foundEntity = hitE;
                 }
             }
@@ -650,6 +836,7 @@ public final class NetherFarmClient implements ClientModInitializer {
                 breakAimTicks = 0;
                 breakApproachTicks = 0;
                 breakTotalTicks = 0;
+                breakStillTicks = 0;
                 handleBreak(mc, player);
                 return;
             } else if (chainActive) {
@@ -785,9 +972,11 @@ public final class NetherFarmClient implements ClientModInitializer {
     }
 
     private static boolean isSpecialEntity(Entity e) {
-        if (e instanceof Player || e instanceof ItemEntity || e.isRemoved()
-                || ignoredEntities.contains(e.getId())
-                || ignoredEntityPositions.contains(e.blockPosition().asLong())) return false;
+        if (e instanceof Player || e instanceof ItemEntity || e.isRemoved()) return false;
+        Long untilId = ignoredEntities.get(e.getId());
+        if (untilId != null && untilId > gameTicks) return false;
+        Long untilPos = ignoredEntityPositions.get(e.blockPosition().asLong());
+        if (untilPos != null && untilPos > gameTicks) return false;
         // Sans hitbox (affichage visuel seulement, ex. verrue brillante) : on ignore.
         if (!e.isPickable()) return false;
         String id = BuiltInRegistries.ENTITY_TYPE.getKey(e.getType()).getPath();
@@ -814,9 +1003,18 @@ public final class NetherFarmClient implements ClientModInitializer {
             double vertical = c.y - pos.y;
             if (forward < -ENTITY_DETECT_BEHIND || forward > ENTITY_DETECT_AHEAD) continue;
             if (Math.abs(lateral) > ENTITY_DETECT_SIDE) continue;
-            if (vertical < -ENTITY_DETECT_DOWN || vertical > ENTITY_DETECT_UP) continue;
-            if (REQUIRE_LINE_OF_SIGHT && !player.hasLineOfSight(e)) continue;
-            if (REQUIRE_VISUAL_NEARBY && !hasVisualNearby(mc, e)) continue;
+            if (vertical < -ENTITY_DETECT_DOWN || vertical > ENTITY_DETECT_UP) {
+                logReject(mc, e, "hauteur " + String.format(Locale.ROOT, "%.1f", vertical) + " blocs");
+                continue;
+            }
+            if (REQUIRE_LINE_OF_SIGHT && !player.hasLineOfSight(e)) {
+                logReject(mc, e, "cachée derrière un bloc");
+                continue;
+            }
+            if (REQUIRE_VISUAL_NEARBY && !hasVisualNearby(mc, e)) {
+                logReject(mc, e, "pas de visuel à côté");
+                continue;
+            }
             double dx = c.x - eye.x;
             double dy = c.y - eye.y;
             double dz = c.z - eye.z;
@@ -829,6 +1027,11 @@ public final class NetherFarmClient implements ClientModInitializer {
         return best;
     }
 
+    private static void logReject(Minecraft mc, Entity e, String reason) {
+        if (!DEBUG_REJECTS || !rejectLogged.add(e.getId())) return;
+        message(mc, "Interaction ignorée (" + reason + ") : " + describeEntity(e));
+    }
+
     /** Une autre entité (affichage, support d'armure...) à moins de ~1 bloc : le visuel de la citrouille. */
     private static boolean hasVisualNearby(Minecraft mc, Entity e) {
         Vec3 p = e.position();
@@ -837,7 +1040,7 @@ public final class NetherFarmClient implements ClientModInitializer {
             Vec3 q = other.position();
             double dx = q.x - p.x;
             double dz = q.z - p.z;
-            if (dx * dx + dz * dz <= 1.44 && Math.abs(q.y - p.y) <= 2.0) return true;
+            if (dx * dx + dz * dz <= 4.0 && Math.abs(q.y - p.y) <= 3.0) return true;
         }
         return false;
     }
@@ -886,7 +1089,7 @@ public final class NetherFarmClient implements ClientModInitializer {
 
         breakTotalTicks++;
         if (breakTotalTicks > BREAK_MAX_TOTAL_TICKS) {
-            finishBreak(mc, false);
+            finishBreak(mc, false, "temps dépassé : " + (BREAK_MAX_TOTAL_TICKS / 20) + " s sur la même cible");
             specialPauseTicks = 100;   // 5 s sans rechercher de cible, pour ne pas rester bloqué
             return;
         }
@@ -897,7 +1100,13 @@ public final class NetherFarmClient implements ClientModInitializer {
                 finishBreak(mc, true);
                 return;
             }
-            center = breakEntity.getBoundingBox().getCenter();
+            // Point visé : le dessus de la hitbox d'abord (le rayon ne traverse que sa propre case),
+            // puis le centre, puis le bas si le viseur ne tombe pas dessus.
+            var bb = breakEntity.getBoundingBox();
+            Vec3 cc = bb.getCenter();
+            int aimIndex = (breakAimTicks / 14) % 3;
+            double aimY = aimIndex == 0 ? bb.maxY - 0.08 : (aimIndex == 1 ? cc.y : bb.minY + 0.1);
+            center = new Vec3(cc.x, aimY, cc.z);
         } else {
             BlockState st = mc.level.getBlockState(breakTarget);
             if (st.isAir() || !isSpecial(st.getBlock())) {
@@ -914,32 +1123,75 @@ public final class NetherFarmClient implements ClientModInitializer {
         double dz = center.z - eye.z;
         float wantYaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
         float wantPitch = (float) -Math.toDegrees(Math.atan2(dy, Math.sqrt(dx * dx + dz * dz)));
+        double hdAim = Math.sqrt(dx * dx + dz * dz);
         float dYaw = Mth.wrapDegrees(wantYaw - player.getYRot());
         float dPitch = wantPitch - player.getXRot();
-        player.setYRot(player.getYRot() + Mth.clamp(dYaw, -MAX_YAW_STEP, MAX_YAW_STEP));
+        // Pile au-dessus d'une entité : on garde le cap, sinon la visée tournerait sur place.
+        boolean overTarget = breakEntity != null && hdAim < 0.45;
+        if (!overTarget) player.setYRot(player.getYRot() + Mth.clamp(dYaw, -MAX_YAW_STEP, MAX_YAW_STEP));
         player.setXRot(player.getXRot() + Mth.clamp(dPitch, -MAX_PITCH_STEP, MAX_PITCH_STEP));
         // Entité trop loin pour être frappée : on s'en approche en la gardant dans le viseur.
+        // On s'approche de l'entité jusqu'à portée de coup (bord de la hitbox à moins de 2,6 blocs).
         if (breakEntity != null) {
-            double hd = Math.sqrt(dx * dx + dz * dz);
-            double dist3 = Math.sqrt(hd * hd + dy * dy);
-            if (dist3 > ENTITY_APPROACH_DIST) {
+            var bbx = breakEntity.getBoundingBox();
+            double nx = Mth.clamp(eye.x, bbx.minX, bbx.maxX);
+            double ny = Mth.clamp(eye.y, bbx.minY, bbx.maxY);
+            double nz = Mth.clamp(eye.z, bbx.minZ, bbx.maxZ);
+            double hn = Math.sqrt((nx - eye.x) * (nx - eye.x) + (nz - eye.z) * (nz - eye.z));
+            double nearest = Math.sqrt(hn * hn + (ny - eye.y) * (ny - eye.y));
+            boolean inRange = BREAK_DIRECT_ATTACK
+                    ? nearest <= BREAK_DIRECT_RANGE
+                    : !(hdAim > 0.9 || Math.sqrt(hdAim * hdAim + dy * dy) > 2.9);
+            if (!inRange) {
                 breakApproachTicks++;
-                if (breakApproachTicks > 60) {
-                    finishBreak(mc, false);
+                if (breakApproachTicks > 120) {
+                    finishBreak(mc, false, "approche trop longue (encore à "
+                            + String.format(Locale.ROOT, "%.1f", nearest) + " blocs)");
                     return;
                 }
-                setKeysFull(mc, hd > 1.2, false, false, false, false, dy < -1.8, false);
+                breakStillTicks = 0;
+                // Régulateur de vitesse : on avance vite de loin, puis de plus en plus doucement,
+                // pour ne pas dépasser la cible (surtout avec l'effet de vitesse).
+                Vec3 vel = player.getDeltaMovement();
+                double yawRad = Math.toRadians(player.getYRot());
+                double fComp = vel.x * (-Math.sin(yawRad)) + vel.z * Math.cos(yawRad);
+                double rComp = vel.x * (-Math.cos(yawRad)) + vel.z * (-Math.sin(yawRad));
+                double remaining = nearest - BREAK_DIRECT_RANGE;
+                double maxSpeed = remaining > 3.0 ? 0.30 : (remaining > 1.2 ? 0.14 : 0.06);
+                boolean fwd = hn > 0.5 && fComp < maxSpeed;
+                boolean back = fComp > Math.max(maxSpeed, 0.15) + 0.10;   // vrai freinage seulement
+                boolean left = rComp > 0.15;
+                boolean right = rComp < -0.15;
+                boolean down = (eye.y - ny) > 2.0 && vel.y > -0.25;
+                setKeysFull(mc, fwd, back, left, right, false, down, false);
                 mc.options.keySprint.setDown(false);
                 return;
             }
         }
-        boolean aligned = Math.abs(Mth.wrapDegrees(wantYaw - player.getYRot())) < 1.5f
-                && Math.abs(wantPitch - player.getXRot()) < 1.5f;
+
+        // À portée : on laisse le mouvement s'éteindre et on n'attaque qu'une fois immobile.
+        {
+            Vec3 vel = player.getDeltaMovement();
+            double yawRad = Math.toRadians(player.getYRot());
+            double fComp = vel.x * (-Math.sin(yawRad)) + vel.z * Math.cos(yawRad);
+            double rComp = vel.x * (-Math.cos(yawRad)) + vel.z * (-Math.sin(yawRad));
+            setKeysFull(mc, fComp < -0.15, fComp > 0.15, rComp > 0.15, rComp < -0.15, false, false, false);
+            mc.options.keySprint.setDown(false);
+            double hSpeed = Math.sqrt(vel.x * vel.x + vel.z * vel.z);
+            if (hSpeed > STILL_SPEED || Math.abs(vel.y) > STILL_SPEED) breakStillTicks = 0;
+            else breakStillTicks++;
+        }
+        if (breakStillTicks < STILL_TICKS_REQUIRED) return;
+        float alignTol = (breakEntity != null && BREAK_DIRECT_ATTACK) ? 12.0f : 1.5f;
+        boolean aligned = (overTarget || Math.abs(Mth.wrapDegrees(wantYaw - player.getYRot())) < alignTol)
+                && Math.abs(wantPitch - player.getXRot()) < alignTol;
         if (!aligned) return;
 
         // Le viseur doit vraiment tomber sur le bloc (pas sur une verrue devant).
         boolean onTarget;
-        if (breakEntity != null) {
+        if (breakEntity != null && BREAK_DIRECT_ATTACK) {
+            onTarget = true;   // attaque directe : pas besoin que le viseur tombe dessus
+        } else if (breakEntity != null) {
             onTarget = mc.hitResult instanceof EntityHitResult eh && eh.getEntity() == breakEntity;
         } else {
             onTarget = mc.hitResult instanceof BlockHitResult hit
@@ -948,7 +1200,7 @@ public final class NetherFarmClient implements ClientModInitializer {
         }
         if (!onTarget) {
             breakAimTicks++;
-            if (breakAimTicks > 40) finishBreak(mc, false);
+            if (breakAimTicks > 44) finishBreak(mc, false, "le viseur voit : " + describeHit(mc));
             return;
         }
         breakAimTicks = 0;
@@ -958,34 +1210,63 @@ public final class NetherFarmClient implements ClientModInitializer {
             return;
         }
         if (breakClicksDone < BREAK_CLICKS) {
-            KeyMapping.click(LEFT_MOUSE);
+            if (breakEntity != null && BREAK_DIRECT_ATTACK) {
+                if (mc.gameMode != null) {
+                    mc.gameMode.attack(player, breakEntity);
+                    player.swing(InteractionHand.MAIN_HAND);
+                }
+            } else {
+                KeyMapping.click(LEFT_MOUSE);
+            }
             breakClicksDone++;
             breakCooldown = BREAK_CLICK_INTERVAL_TICKS;
             return;
         }
         // Série terminée : on laisse 10 ticks au serveur pour répondre, puis on recommence si le bloc est là.
         if (breakSettle < 10) {
+            if (breakSettle == 0 && DEBUG_TARGETS) {
+                message(mc, "Série " + (breakRounds + 1) + " : " + BREAK_CLICKS + " coups donnés"
+                        + (breakEntity != null ? " (attaque " + (BREAK_DIRECT_ATTACK ? "directe" : "par clic") + ")" : "")
+                        + ", j'attends la réaction du serveur.");
+            }
             breakSettle++;
             return;
         }
         breakRounds++;
         if (breakRounds >= BREAK_MAX_ROUNDS) {
-            finishBreak(mc, false);
+            finishBreak(mc, false, BREAK_MAX_ROUNDS + " séries de " + BREAK_CLICKS
+                    + " coups sans effet : la cible est toujours là");
         } else {
             breakClicksDone = 0;
             breakSettle = 0;
         }
     }
 
+    private static String describeHit(Minecraft mc) {
+        if (mc.hitResult instanceof EntityHitResult eh) {
+            return "entité " + BuiltInRegistries.ENTITY_TYPE.getKey(eh.getEntity().getType()).getPath();
+        }
+        if (mc.hitResult instanceof BlockHitResult hit && hit.getType() == HitResult.Type.BLOCK) {
+            return "bloc " + BuiltInRegistries.BLOCK.getKey(mc.level.getBlockState(hit.getBlockPos()).getBlock()).getPath();
+        }
+        return "rien";
+    }
+
     private static void finishBreak(Minecraft mc, boolean success) {
+        finishBreak(mc, success, null);
+    }
+
+    private static void finishBreak(Minecraft mc, boolean success, String reason) {
         if (!success) {
             if (breakEntity != null) {
-                ignoredEntities.add(breakEntity.getId());
-                ignoredEntityPositions.add(breakEntity.blockPosition().asLong());
+                ignoredEntities.put(breakEntity.getId(), gameTicks + IGNORE_TICKS);
+                ignoredEntityPositions.put(breakEntity.blockPosition().asLong(), gameTicks + IGNORE_TICKS);
             }
             else if (breakTarget != null) ignoredBreak.add(breakTarget);
         }
-        if (!success) message(mc, "Cible non cassée, je l'ignore.");
+        if (!success) {
+            message(mc, "Cible non cassée" + (reason != null ? " (" + reason + ")" : "") + ", je l'ignore.");
+        }
         breaking = false;
         breakTarget = null;
         breakEntity = null;
