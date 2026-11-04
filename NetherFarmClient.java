@@ -7,6 +7,7 @@ import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
 import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.screens.ChatScreen;
 import net.minecraft.client.gui.screens.PauseScreen;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
@@ -170,7 +171,17 @@ public final class NetherFarmClient implements ClientModInitializer {
     private static final boolean DUMP_CONTAINER_SCREENS = true;
 
     // ---- Tirage de cartes automatique ----
-    private static final boolean CARD_AUTO_ENABLED = true;
+    /** true = ferme tout menu qui s'ouvre pendant le farm, comme si tu appuyais sur Échap. */
+    private static final boolean AUTO_CLOSE_MENUS = true;
+    private static final int AUTO_CLOSE_MIN_TICKS = 20;      // délai minimum avant de fermer (1 s)
+    private static final int AUTO_CLOSE_JITTER_TICKS = 14;   // + 0 à 0,7 s au hasard
+    /** Tirage de cartes par clics : désactivé tant que la fermeture suffit. */
+    private static final boolean CARD_AUTO_ENABLED = false;
+    /** true = les cartes sont aussi tirées quand le farm est arrêté (menu ouvert à la main, par exemple). */
+    private static final boolean CARD_WHEN_IDLE = true;
+    /** true = pendant le farm, le chat annonce chaque nouvel écran ouvert (type et titre) pour le diagnostic. */
+    private static final boolean DEBUG_SCREENS = true;
+    private static final String VERSION_TAG = "v1.1 fermeture des menus";
     /** Mots (en minuscules) qui identifient un menu de cartes : dans le titre du menu ou le nom des cartes. */
     private static final String[] CARD_KEYWORDS = {"carte", "card", "podium"};
     /** true = clique sur le butin apparu (shift-clic) avant de fermer. */
@@ -243,6 +254,10 @@ public final class NetherFarmClient implements ClientModInitializer {
     private static final Set<Integer> cardTried = new HashSet<>();
     private static final Set<Integer> cardEmptyAtStart = new TreeSet<>();
     private static final List<Integer> cardLoot = new ArrayList<>();
+    private static Screen closeScreen = null;
+    private static int closeWait = 0;
+    private static boolean closeDone = false;
+    private static Screen debugScreen = null;
     private static Screen dumpScreen = null;
     private static int dumpTicks = 0;
     private static boolean dumped = false;
@@ -348,6 +363,14 @@ public final class NetherFarmClient implements ClientModInitializer {
                 message(mc, "Vise d'abord la citrouille dorée.");
             }
         }
+        // Menus ouverts : diagnostic, liste du contenu, tirage de cartes (farm en cours ou non).
+        if (mc.screen != null) {
+            if (running && DEBUG_SCREENS) debugScreenIfNew(mc);
+            if (running && DUMP_CONTAINER_SCREENS) dumpContainerIfNew(mc, player);
+            if (running && AUTO_CLOSE_MENUS) autoCloseMenu(mc);
+            if (CARD_AUTO_ENABLED && (running || CARD_WHEN_IDLE)) handleCardScreen(mc, player, running);
+        }
+
         while (holdKey.consumeClick()) {
             if (simpleRunning) {
                 stopSimple(mc);
@@ -392,8 +415,6 @@ public final class NetherFarmClient implements ClientModInitializer {
         }
         if (mc.screen != null) {
             releaseKeys(mc);
-            if (DUMP_CONTAINER_SCREENS) dumpContainerIfNew(mc, player);
-            if (CARD_AUTO_ENABLED) handleCardScreen(mc, player);
             return;
         }
 
@@ -453,6 +474,35 @@ public final class NetherFarmClient implements ClientModInitializer {
         message(mc, "Bande " + laneCounter + " terminée : /" + cmd + " envoyé.");
     }
 
+    /**
+     * Ferme un menu qui vient de s'ouvrir, comme Échap : on appelle onClose() de l'écran, ce que fait
+     * la touche Échap. Le chat, le menu pause et ton inventaire ne sont pas touchés.
+     */
+    private static void autoCloseMenu(Minecraft mc) {
+        Screen sc = mc.screen;
+        if (sc instanceof ChatScreen || sc instanceof PauseScreen || sc instanceof InventoryScreen) return;
+        if (!sc.shouldCloseOnEsc()) return;   // écrans qu'Échap ne ferme pas (mort, etc.)
+        if (sc != closeScreen) {
+            closeScreen = sc;
+            closeWait = AUTO_CLOSE_MIN_TICKS + RNG.nextInt(AUTO_CLOSE_JITTER_TICKS + 1);
+            closeDone = false;
+        }
+        if (closeDone) return;
+        if (--closeWait > 0) return;
+        closeDone = true;
+        message(mc, "Menu fermé (Échap) : " + sc.getClass().getSimpleName()
+                + " « " + sc.getTitle().getString() + " ». Le farm reprend.");
+        sc.onClose();
+    }
+
+    private static void debugScreenIfNew(Minecraft mc) {
+        Screen sc = mc.screen;
+        if (sc == debugScreen) return;
+        debugScreen = sc;
+        if (sc instanceof ChatScreen || sc instanceof PauseScreen || sc instanceof InventoryScreen) return;
+        message(mc, "Écran ouvert : " + sc.getClass().getSimpleName() + " « " + sc.getTitle().getString() + " »");
+    }
+
     private static String stackSig(ItemStack st) {
         if (st.isEmpty()) return "vide";
         return BuiltInRegistries.ITEM.getKey(st.getItem()).getPath() + "|" + st.getHoverName().getString()
@@ -478,7 +528,7 @@ public final class NetherFarmClient implements ClientModInitializer {
      * avec des délais variables, s'arrête quand plus aucune ne se retourne, récupère le butin, ferme le menu.
      * Ne fait rien si le menu n'est pas reconnu comme un menu de cartes.
      */
-    private static void handleCardScreen(Minecraft mc, LocalPlayer player) {
+    private static void handleCardScreen(Minecraft mc, LocalPlayer player, boolean verbose) {
         Screen sc = mc.screen;
         if (!(sc instanceof AbstractContainerScreen<?> cs) || sc instanceof InventoryScreen) return;
         if (sc != cardScreen) {
@@ -528,7 +578,7 @@ public final class NetherFarmClient implements ClientModInitializer {
                 }
                 if (best == null || !(titleMatch || bestKeyword)) {
                     cardDone = true;
-                    message(mc, "Menu non reconnu comme un tirage de cartes : je te laisse la main.");
+                    if (verbose) message(mc, "Menu non reconnu comme un tirage de cartes : je te laisse la main.");
                     return;
                 }
                 cardSlots.addAll(best);
@@ -689,7 +739,7 @@ public final class NetherFarmClient implements ClientModInitializer {
         stuckTicks = 0;
         stuckAnchor = startAlong;
         message(mc, "Parcours lancé : " + LANE_COUNT + " bandes x " + FLOORS
-                + " étage(s), fin de bande = bloc de verre.");
+                + " étage(s), fin de bande = bloc de verre. [" + VERSION_TAG + "]");
     }
 
     private static void runTick(Minecraft mc, LocalPlayer player) {
